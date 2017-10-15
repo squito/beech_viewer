@@ -19,7 +19,8 @@ package com.imranrashid
 import java.io.{FileOutputStream, FileInputStream, File}
 import java.net.{HttpURLConnection, URL}
 import java.nio.channels.Channels
-import java.nio.file.Files
+import java.nio.file.attribute.{FileTime, BasicFileAttributeView}
+import java.nio.file.{Paths, Files}
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.concurrent.TimeUnit
@@ -103,6 +104,9 @@ object InstagramDownloader extends ArgMain[InstagramDownloaderArgs] {
       dest.delete()
     }
     downloadWithRetries(url, dest)
+    val attributes = Files.getFileAttributeView(dest.toPath, classOf[BasicFileAttributeView]);
+    val time = FileTime.fromMillis(item.getTaken_at * 1000);
+    attributes.setTimes(time, time, time);
     println(s"downloaded $url to $dest")
     // TODO get hash of downloaded file
   }
