@@ -16,8 +16,12 @@
  */
 package com.imranrashid
 
-import java.io.{FileInputStream, File}
+import java.io.{FileOutputStream, FileInputStream, File}
 import java.net.{HttpURLConnection, URL}
+import java.nio.channels.Channels
+import java.nio.file.Files
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.concurrent.TimeUnit
 
 import org.brunocvcunha.instagram4j.requests.payload.InstagramFeedItem
@@ -36,37 +40,14 @@ object InstagramDownloader extends ArgMain[InstagramDownloaderArgs] {
     instagram.setup()
     instagram.login()
 
-    val userReq = new InstagramSearchUsernameRequest("beech3111")
+    val userReq = new InstagramSearchUsernameRequest(args.targetAccount)
     val userInfo = instagram.sendRequest(userReq)
     val userPk = userInfo.getUser.getPk
-    println(s"beech pk = ${userPk}")
-
 
     val now = System.currentTimeMillis()
-    val tenDaysAgo = (now - TimeUnit.DAYS.toMillis(10)) / 1000
-    val feedReq = new InstagramUserFeedRequest(userPk, null, tenDaysAgo)
-    val feed = instagram.sendRequest(feedReq)
-    println(s"Got ${feed.getNum_results} items from feed")
+    val nDaysAgo = (now - TimeUnit.DAYS.toMillis(args.lastNDays)) / 1000
 
-
-    feed.getItems.asScala.take(2).foreach { item =>
-      val likers = if (item.getLikers != null) {
-        item.getLikers.asScala.map{_.getUsername}.mkString(",")
-      } else {
-        "<none>"
-      }
-      println(s"feed item ${item.getId} with likers $likers")
-      println(s"taken at ${item.getTaken_at}")
-      println(s"device timestamp${item.getDevice_timestamp}")
-      item.getImage_versions2.asScala.foreach { case (k, v) =>
-        println(k -> v)
-        println(v.getClass())
-          // SUCCESS !!! the full size URL is buried in here
-      }
-      println()
-    }
-
-    val itr = new FeedIterator(instagram, userPk, tenDaysAgo)
+    val itr = new FeedIterator(instagram, userPk, nDaysAgo)
     // just in case, don't want to accidentally go crazy
     val subItr = itr.take(10000)
 
@@ -80,7 +61,9 @@ object InstagramDownloader extends ArgMain[InstagramDownloaderArgs] {
     }.toIndexedSeq
 
 
-    liked.foreach { item => println(getMaxImgUrl(item)) }
+    liked.foreach { item =>
+      download(item, args.dataDir)
+    }
   }
 
 
@@ -88,6 +71,66 @@ object InstagramDownloader extends ArgMain[InstagramDownloaderArgs] {
     val candidates = item.getImage_versions2.get("candidates").asInstanceOf[java.util.ArrayList[java.util.Map[String, AnyRef]]]
     val widthToUrl = candidates.asScala.map { kvs => kvs.get("width").asInstanceOf[java.lang.Integer] -> kvs.get("url").asInstanceOf[String]}
     widthToUrl.maxBy{_._1}._2
+  }
+
+  def getMaxVideoUrl(item: InstagramFeedItem): String = {
+    val versions = item.getVideo_versions.asInstanceOf[java.util.ArrayList[java.util.Map[String, AnyRef]]]
+    val widthToUrl = versions.asScala.map { kvs => kvs.get("width").asInstanceOf[java.lang.Integer] -> kvs.get("url").asInstanceOf[String]}
+    widthToUrl.maxBy{_._1}._2
+  }
+
+  val simpleFormatter = new SimpleDateFormat("yyyyMMddHHmmss")
+  def localFileName(item: InstagramFeedItem): String = {
+    val d = new Date(item.getTaken_at * 1000)
+    simpleFormatter.format(d) + "_" + item.getId
+  }
+
+  def download(item: InstagramFeedItem, destDir: File): Unit = {
+    val url = new URL(if (item.getVideo_versions != null) {
+      getMaxVideoUrl(item)
+    } else {
+      getMaxImgUrl(item)
+    })
+    val p = url.getPath.lastIndexOf('.')
+    val extension = if (p > 0) {
+      url.getPath().substring(p)
+    } else {
+      ""
+    }
+    val dest = new File(destDir, localFileName(item) + extension)
+    // TODO more general behavior if file exists?  probably best to always delete ...
+    if (dest.exists()) {
+      dest.delete()
+    }
+    downloadWithRetries(url, dest)
+    println(s"downloaded $url to $dest")
+    // TODO get hash of downloaded file
+  }
+
+  def downloadWithRetries(url: URL, dest: File, maxTries: Int = 10, waitMs: Int = 1000): Unit = {
+    // Some files really take a long time to download -- perhaps especially long videos.  eg
+    // wget needed 6 tries to get https://instagram.ford4-1.fna.fbcdn.net/t50.2886-16/21847929_1398889866894051_306498340940414976_n.mp4
+    // so just retry
+    var tries = 0
+    var done = false
+    while (!done && tries < maxTries) {
+      if (dest.exists()) {
+        dest.delete()
+      }
+      val conn = url.openConnection().asInstanceOf[HttpURLConnection]
+      val expectedLength = conn.getContentLength
+      val downloadedBytes = Files.copy(conn.getInputStream(), dest.toPath)
+      if (downloadedBytes == 0 || (expectedLength != -1 && downloadedBytes != expectedLength)) {
+        println(s"failed to download $url after $tries (got $downloadedBytes, short ${expectedLength - downloadedBytes})")
+        Thread.sleep(waitMs)
+      } else {
+        done = true
+      }
+      tries += 1
+    }
+    if (!done) {
+      throw new RuntimeException(s"failed to download $url after $tries")
+    }
   }
 
   class FeedIterator(val instagram: Instagram4j, val userPk: Long, val minTimeSeconds: Long) extends Iterator[InstagramFeedItem] {
@@ -119,20 +162,28 @@ object InstagramDownloader extends ArgMain[InstagramDownloaderArgs] {
 }
 
 class InstagramDownloaderArgs extends FieldArgs {
+  var targetAccount = "beech3111"
+  var lastNDays = 30
   var likers: Set[String] = Set("dianarashid", "nabiha610", "imranrashid81")
   var maxKnownLikers = 10
   var user: String = _
   var password: String = _
-  var loginPropertyFile: File = _
+  var loginPropertyFile: File = new File("login.props")
+  var dataDir: File = new File("/Users/irashid/Dropbox/photos/instagram_raw_download")
+
 
   lazy val loginProperties = {
     val p = new java.util.Properties()
-    val in = new FileInputStream(loginPropertyFile)
-    try {
-      p.load(in)
+    if (loginPropertyFile.exists() && loginPropertyFile.isFile()) {
+      val in = new FileInputStream(loginPropertyFile)
+      try {
+        p.load(in)
+        p
+      } finally {
+        in.close()
+      }
+    } else {
       p
-    } finally {
-      in.close()
     }
   }
 
@@ -140,11 +191,30 @@ class InstagramDownloaderArgs extends FieldArgs {
     // TODO there should be a generic way to get this from a file ... but right now sumac only supports
     // typesafe config which seems like overkill
     if (user == null) {
-      user = sys.env.getOrElse("USER", loginProperties.get("user").asInstanceOf[String])
+      user = sys.env.getOrElse("INSTA_USER", loginProperties.get("user").asInstanceOf[String])
     }
     if (password == null) {
       password = sys.env.getOrElse("PASSWORD", loginProperties.get("password").asInstanceOf[String])
     }
+
+    dataDir.mkdirs()
   }
 }
 
+
+case class DownloadLogLine(instaId: String, takenAt: Long, murmur: String, localFile: String) {
+  def toLogLine: String = {
+    productIterator.mkString("\t")
+  }
+}
+
+object DownloadLogLine {
+  def parse(logLine: String): DownloadLogLine = {
+    logLine.split("\t") match {
+      case Array(instaId, takenAtStr, murmur, localFile) =>
+        DownloadLogLine(instaId, takenAtStr.toLong, murmur, localFile)
+      case other =>
+        throw new RuntimeException("can't parse line \"" + logLine + "\"")
+    }
+  }
+}

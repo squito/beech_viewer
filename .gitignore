@@ -3,3 +3,5 @@ lib_managed
 *.iml
 */target
 target
+
+core/login.props
