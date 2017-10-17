@@ -16,23 +16,24 @@
  */
 package com.imranrashid
 
-import java.io.{FileOutputStream, FileInputStream, File}
+import java.io._
 import java.net.{HttpURLConnection, URL}
-import java.nio.channels.Channels
 import java.nio.file.attribute.{FileTime, BasicFileAttributeView}
-import java.nio.file.{Paths, Files}
+import java.nio.file.{Path, Files}
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.concurrent.TimeUnit
 
-import org.brunocvcunha.instagram4j.requests.payload.InstagramFeedItem
-
 import scala.collection.JavaConverters._
+import scala.io.Source
 
 import com.quantifind.sumac.{ArgMain, FieldArgs}
+import org.brunocvcunha.instagram4j.requests.payload.InstagramFeedItem
 import org.brunocvcunha.instagram4j.Instagram4j
 import org.brunocvcunha.instagram4j.requests.{InstagramUserFeedRequest, InstagramSearchUsernameRequest}
 
+import com.imranrashid.util.MurmurHash3
+import com.imranrashid.util.MurmurHash3.LongPair
 
 object InstagramDownloader extends ArgMain[InstagramDownloaderArgs] {
 
@@ -45,10 +46,13 @@ object InstagramDownloader extends ArgMain[InstagramDownloaderArgs] {
     val userInfo = instagram.sendRequest(userReq)
     val userPk = userInfo.getUser.getPk
 
-    val now = System.currentTimeMillis()
-    val nDaysAgo = (now - TimeUnit.DAYS.toMillis(args.lastNDays)) / 1000
+    val downloadLogFile = new File(args.dataDir, "download.log").toPath
+    val downloadLog = DownloadLog.apply(downloadLogFile)
 
-    val itr = new FeedIterator(instagram, userPk, nDaysAgo)
+    val now = System.currentTimeMillis()
+    val nDaysAgoSecs = (now - TimeUnit.DAYS.toMillis(args.lastNDays)) / 1000
+
+    val itr = new FeedIterator(instagram, userPk, nDaysAgoSecs)
     // just in case, don't want to accidentally go crazy
     val subItr = itr.take(10000)
 
@@ -62,9 +66,12 @@ object InstagramDownloader extends ArgMain[InstagramDownloaderArgs] {
     }.toIndexedSeq
 
 
-    liked.foreach { item =>
-      download(item, args.dataDir)
+    val finalDownloadLog = liked.foldLeft(downloadLog) { case( log, item) =>
+      download(item, args.dataDir, log)
     }
+
+    val minLogTime = now - TimeUnit.DAYS.toMillis(args.downloadTruncationDays)
+    finalDownloadLog.truncateAndSave(downloadLogFile, minLogTime)
   }
 
 
@@ -86,7 +93,7 @@ object InstagramDownloader extends ArgMain[InstagramDownloaderArgs] {
     simpleFormatter.format(d) + "_" + item.getId
   }
 
-  def download(item: InstagramFeedItem, destDir: File): Unit = {
+  def download(item: InstagramFeedItem, destDir: File, downloadLog: DownloadLog): DownloadLog = {
     val url = new URL(if (item.getVideo_versions != null) {
       getMaxVideoUrl(item)
     } else {
@@ -98,17 +105,29 @@ object InstagramDownloader extends ArgMain[InstagramDownloaderArgs] {
     } else {
       ""
     }
-    val dest = new File(destDir, localFileName(item) + extension)
-    // TODO more general behavior if file exists?  probably best to always delete ...
-    if (dest.exists()) {
-      dest.delete()
+    if (downloadLog.containsId(item.getId())) {
+      println(s"already downloaded item ${item.getId()}, skipping")
+      downloadLog
+    } else {
+      val dest = new File(destDir, localFileName(item) + extension)
+      // TODO more general behavior if file exists?  probably best to always delete ...
+      if (dest.exists()) {
+        dest.delete()
+      }
+      downloadWithRetries(url, dest)
+      val attributes = Files.getFileAttributeView(dest.toPath, classOf[BasicFileAttributeView]);
+      val time = FileTime.fromMillis(item.getTaken_at * 1000);
+      attributes.setTimes(time, time, time);
+      println(s"downloaded $url to $dest")
+      val (hash1, hash2) = fileMurmur(dest.toPath)
+      val hashString = java.lang.Long.toHexString(hash1) + java.lang.Long.toHexString(hash2)
+      if (downloadLog.containsHash(hashString).isDefined) {
+        println("already downloaded file with matching hash!  deleting")
+        Files.delete(dest.toPath)
+      }
+      val newLog = DownloadLogLine(item.getId(), item.getTaken_at * 1000, hashString, dest.toString)
+      downloadLog.addEntry(newLog)
     }
-    downloadWithRetries(url, dest)
-    val attributes = Files.getFileAttributeView(dest.toPath, classOf[BasicFileAttributeView]);
-    val time = FileTime.fromMillis(item.getTaken_at * 1000);
-    attributes.setTimes(time, time, time);
-    println(s"downloaded $url to $dest")
-    // TODO get hash of downloaded file
   }
 
   def downloadWithRetries(url: URL, dest: File, maxTries: Int = 10, waitMs: Int = 1000): Unit = {
@@ -135,6 +154,15 @@ object InstagramDownloader extends ArgMain[InstagramDownloaderArgs] {
     if (!done) {
       throw new RuntimeException(s"failed to download $url after $tries")
     }
+  }
+
+  def fileMurmur(file: Path): (Long, Long) = {
+    // sadly I dont' see a good way to do a *streaming* murmurhash that returns 128 bits.
+    // TODO change the copied implementation to have a streaming version.
+    val bytes = Files.readAllBytes(file)
+    val out = new LongPair()
+    MurmurHash3.murmurhash3_x64_128(bytes, 0, bytes.length, 0, out)
+    (out.val1, out.val2)
   }
 
   class FeedIterator(val instagram: Instagram4j, val userPk: Long, val minTimeSeconds: Long) extends Iterator[InstagramFeedItem] {
@@ -167,13 +195,15 @@ object InstagramDownloader extends ArgMain[InstagramDownloaderArgs] {
 
 class InstagramDownloaderArgs extends FieldArgs {
   var targetAccount = "beech3111"
-  var lastNDays = 30
+  var lastNDays = 60
   var likers: Set[String] = Set("dianarashid", "nabiha610", "imranrashid81")
   var maxKnownLikers = 10
   var user: String = _
   var password: String = _
   var loginPropertyFile: File = new File("login.props")
   var dataDir: File = new File("/Users/irashid/Dropbox/photos/instagram_raw_download")
+
+  var downloadTruncationDays = 365
 
 
   lazy val loginProperties = {
@@ -205,6 +235,60 @@ class InstagramDownloaderArgs extends FieldArgs {
   }
 }
 
+class DownloadLog(
+    val itemsByHash: Map[String, DownloadLogLine],
+    val itemsById: Map[String, DownloadLogLine]
+) {
+
+  def containsId(id: String): Boolean = {
+    itemsById.contains(id)
+  }
+
+  def containsHash(hash: String): Option[String] = {
+    itemsByHash.get(hash).map{_.localFile}
+  }
+
+  def addEntry(logLine: DownloadLogLine): DownloadLog = {
+    new DownloadLog(
+      itemsByHash + (logLine.murmur -> logLine),
+      itemsById + (logLine.instaId -> logLine)
+    )
+  }
+
+  def truncateAndSave(dest: Path, minDate: Long): Unit = {
+    val items = itemsByHash.values.toIndexedSeq.filter{_.takenAt >= minDate}.sortBy{_.takenAt}
+    Files.deleteIfExists(dest)
+    val out = new PrintWriter(Files.newBufferedWriter(dest))
+    items.foreach { item => out.println(item.toLogLine)}
+    out.close()
+  }
+
+  override def toString(): String = {
+    val items = itemsByHash.values.toIndexedSeq
+    items.map{_.toLogLine}.mkString("\n")
+  }
+}
+
+object DownloadLog {
+  def apply(path: Path): DownloadLog = {
+    if (Files.exists(path)) {
+      try {
+        Source.fromFile(path.toFile()).getLines()
+          .foldLeft(new DownloadLog(Map(), Map())) {
+            case (log, line) =>
+              val parsed = DownloadLogLine.parse(line)
+              log.addEntry(parsed)
+          }
+      } catch {
+        case exception: Exception =>
+          exception.printStackTrace()
+          new DownloadLog(Map(), Map())
+      }
+    } else {
+      new DownloadLog(Map(), Map())
+    }
+  }
+}
 
 case class DownloadLogLine(instaId: String, takenAt: Long, murmur: String, localFile: String) {
   def toLogLine: String = {
